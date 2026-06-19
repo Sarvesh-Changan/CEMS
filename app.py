@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, make_response
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, make_response, send_file, g
 from flask_wtf.csrf import CSRFProtect
 import mysql.connector
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from config import Config, DB_CONFIG
 from functools import wraps
 import io
 import traceback
+from contextlib import contextmanager
 
 try:
     import cloudinary  # type: ignore
@@ -132,52 +133,58 @@ def request_entity_too_large(error):
 
 
 class DBWrapper:
-    """Lightweight DB wrapper that connects lazily and provides cursor with dictionary results."""
+    """Request-scoped DB wrapper for Flask serverless and WSGI deployments."""
     
     def __init__(self, cfg):
         self.cfg = cfg
-        self.conn = None
         self._schema_checked = False
 
-    def connect(self):
-        if self.conn:
+    def _create_connection(self):
+        conn_kwargs = {
+            'host': self.cfg['host'],
+            'port': self.cfg.get('port', 3306),
+            'user': self.cfg['user'],
+            'password': self.cfg['password'],
+            'database': self.cfg['database'],
+            'connection_timeout': 5,
+            'use_pure': True,
+        }
+        if self.cfg.get('ssl_ca'):
+            conn_kwargs['ssl_ca'] = self.cfg['ssl_ca']
+            conn_kwargs['ssl_verify_cert'] = True
+            conn_kwargs['ssl_verify_identity'] = True
+
+        print(
+            "Connecting to MySQL: "
+            f"host={self.cfg['host']}, port={conn_kwargs['port']}, "
+            f"user={self.cfg['user']}, db={self.cfg['database']}, "
+            f"ssl={'on' if conn_kwargs.get('ssl_ca') else 'off'}"
+        )
+        return mysql.connector.connect(**conn_kwargs)
+
+    def _get_request_connection(self):
+        conn = getattr(g, '_db_conn', None)
+        if conn is not None:
             try:
-                if self.conn.is_connected():
-                    return
+                if conn.is_connected():
+                    return conn
             except Exception:
-                pass  # proceed to reconnect
+                pass
 
-        try:
-            conn_kwargs = {
-                'host': self.cfg['host'],
-                'port': self.cfg.get('port', 3306),
-                'user': self.cfg['user'],
-                'password': self.cfg['password'],
-                'database': self.cfg['database'],
-            }
-            if self.cfg.get('ssl_ca'):
-                conn_kwargs['ssl_ca'] = self.cfg['ssl_ca']
+        conn = self._create_connection()
+        g._db_conn = conn
+        self._ensure_gallery_schema(conn)
+        return conn
 
-            print(
-                "Connecting to MySQL: "
-                f"host={self.cfg['host']}, port={conn_kwargs['port']}, "
-                f"user={self.cfg['user']}, db={self.cfg['database']}, "
-                f"ssl={'on' if conn_kwargs.get('ssl_ca') else 'off'}"
-            )
-            self.conn = mysql.connector.connect(**conn_kwargs)
-            print("Database connection successful!")
-            self._ensure_gallery_schema()
-        except Exception as e:
-            print(f"Database connection failed: {str(e)}")
-            self.conn = None
-            raise RuntimeError(f"Database connection failed: {str(e)}")
+    def connect(self):
+        self._get_request_connection()
 
-    def _ensure_gallery_schema(self):
-        if self._schema_checked or not self.conn:
+    def _ensure_gallery_schema(self, conn):
+        if self._schema_checked:
             return
 
         try:
-            cursor = self.conn.cursor(dictionary=True)
+            cursor = conn.cursor(dictionary=True)
             cursor.execute("""
                 SELECT COLUMN_NAME
                 FROM information_schema.COLUMNS
@@ -187,7 +194,7 @@ class DBWrapper:
 
             if 'image_url' not in existing_columns:
                 cursor.execute("ALTER TABLE gallery ADD COLUMN image_url VARCHAR(1000) NULL AFTER image_path")
-                self.conn.commit()
+                conn.commit()
 
             cursor.close()
             self._schema_checked = True
@@ -195,25 +202,64 @@ class DBWrapper:
             print(f"Gallery schema check skipped or failed: {schema_error}")
 
     def cursor(self, dictionary=True):
-        self.connect()
-        if not self.conn:
+        conn = self._get_request_connection()
+        if not conn:
             raise RuntimeError('Database not available. Check DB credentials in environment or config.')
-        return self.conn.cursor(dictionary=dictionary)
+        return conn.cursor(dictionary=dictionary)
 
     def commit(self):
-        if not self.conn:
+        conn = getattr(g, '_db_conn', None)
+        if not conn:
             raise RuntimeError('Database not available. Cannot commit.')
-        return self.conn.commit()
+        return conn.commit()
 
     def rollback(self):
-        if not self.conn:
+        conn = getattr(g, '_db_conn', None)
+        if not conn:
             raise RuntimeError('Database not available. Cannot rollback.')
-        return self.conn.rollback()
+        return conn.rollback()
+
+    def is_connected(self):
+        conn = getattr(g, '_db_conn', None)
+        if not conn:
+            return False
+        try:
+            return conn.is_connected()
+        except Exception:
+            return False
+
+    def close(self):
+        conn = g.pop('_db_conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # Create a single DBWrapper instance for the application
 db = DBWrapper(DB_CONFIG)
 db_api = SimpleNamespace(connection=db)
+
+
+@app.teardown_appcontext
+def close_db_connection(_exc=None):
+    """Ensure the per-request MySQL connection is always closed."""
+    db.close()
+
+
+@contextmanager
+def db_cursor(dictionary=True):
+    """Context-managed cursor that commits on success and rolls back on error."""
+    cursor = db_api.connection.cursor(dictionary=dictionary)
+    try:
+        yield cursor
+        db_api.connection.commit()
+    except Exception:
+        db_api.connection.rollback()
+        raise
+    finally:
+        cursor.close()
 
 # Helper functions
 def hash_password(password):
@@ -630,15 +676,15 @@ def register_event():
 # Entry Pass Generation
 @app.route('/api/events/<int:event_id>/entry-pass')
 @app.route('/entry-pass/<int:event_id>')
-@login_required
 def generate_entry_pass(event_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Authentication required'}), 401
+
     if session.get('role') != 'student':
-        flash('Student access only', 'error')
-        return redirect(url_for('home'))
+        return jsonify({'error': 'Student access only'}), 403
     
     if not REPORTLAB_AVAILABLE:
-        flash('PDF generation is not available. Please install reportlab package.', 'error')
-        return redirect(url_for('events'))
+        return jsonify({'error': 'PDF generation is not available'}), 500
     
     cursor = db_api.connection.cursor()
     
@@ -648,8 +694,7 @@ def generate_entry_pass(event_id):
         event = cursor.fetchone()
         
         if not event:
-            flash('Event not found!', 'error')
-            return redirect(url_for('events'))
+            return jsonify({'error': 'Event not found'}), 404
         
         # Check if student is registered for this event
         cursor.execute("""
@@ -663,8 +708,7 @@ def generate_entry_pass(event_id):
         registration = cursor.fetchone()
         
         if not registration:
-            flash('You are not registered for this event!', 'error')
-            return redirect(url_for('events'))
+            return jsonify({'error': 'You are not registered for this event'}), 403
         
         # Generate PDF with compact, attractive design
         buffer = io.BytesIO()
@@ -837,22 +881,22 @@ def generate_entry_pass(event_id):
         # Build PDF
         doc.build(story)
         
-        # Get PDF content
-        pdf_content = buffer.getvalue()
-        buffer.close()
-        
-        # Create response
-        response = make_response(pdf_content)
-        response.headers['Content-Type'] = 'application/pdf'
-        response.headers['Content-Disposition'] = f'attachment; filename=entry-pass-{event_id}-{registration["student_number"]}.pdf'
-        
-        return response
+        # Send the PDF directly from memory. Vercel/serverless has no durable
+        # filesystem, so BytesIO is the right transport here.
+        buffer.seek(0)
+        filename = f'entry-pass-{event_id}-{registration["student_number"]}.pdf'
+        return send_file(
+            buffer,
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=filename,
+            max_age=0
+        )
         
     except Exception as e:
         print(f"Error generating entry pass for event {event_id}: {e}")
         print(traceback.format_exc())
-        flash('Error generating entry pass!', 'error')
-        return redirect(url_for('events'))
+        return jsonify({'error': 'Failed to generate entry pass'}), 500
     finally:
         cursor.close()
 
@@ -1796,7 +1840,7 @@ def get_message_data(message_id):
 def test_database():
     try:
         # Test database connection
-        if not db_api.connection.conn or not db_api.connection.conn.is_connected():
+        if not db_api.connection.is_connected():
             print("Database connection lost, attempting to reconnect...")
             db_api.connection.connect()
         

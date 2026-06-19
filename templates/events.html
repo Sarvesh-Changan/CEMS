@@ -723,13 +723,10 @@ function downloadEntryPass(eventId) {
     downloadBtn.disabled = true;
     
     const downloadUrl = `/api/events/${eventId}/entry-pass`;
-    
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.download = `entry-pass-${eventId}.pdf`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+
+    // Let the server decide the response type; the PDF route now returns a
+    // proper attachment directly, which is more reliable on Vercel.
+    window.location.href = downloadUrl;
     
     setTimeout(() => {
         downloadBtn.innerHTML = originalText;
