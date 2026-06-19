@@ -151,8 +151,11 @@ class DBWrapper:
         }
         if self.cfg.get('ssl_ca'):
             conn_kwargs['ssl_ca'] = self.cfg['ssl_ca']
-            conn_kwargs['ssl_verify_cert'] = True
-            conn_kwargs['ssl_verify_identity'] = True
+            # Verify the CA chain in production; hostname verification is
+            # intentionally opt-in because older mysql-connector-python builds
+            # still call ssl.match_hostname() and break on newer Python runtimes.
+            conn_kwargs['ssl_verify_cert'] = self.cfg.get('ssl_verify_cert', True)
+            conn_kwargs['ssl_verify_identity'] = self.cfg.get('ssl_verify_identity', False)
 
         print(
             "Connecting to MySQL: "
@@ -259,7 +262,10 @@ def db_cursor(dictionary=True):
         db_api.connection.rollback()
         raise
     finally:
-        cursor.close()
+        try:
+            cursor.close()
+        except Exception:
+            pass
 
 # Helper functions
 def hash_password(password):

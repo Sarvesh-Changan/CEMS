@@ -36,7 +36,10 @@ class Config:
     DEBUG = os.getenv('DEBUG', 'false').lower() in ('1', 'true', 'yes', 'on')
     PREFERRED_URL_SCHEME = 'https'
     SESSION_COOKIE_HTTPONLY = True
-    SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'false').lower() in ('1', 'true', 'yes', 'on')
+    SESSION_COOKIE_SECURE = os.getenv(
+        'SESSION_COOKIE_SECURE',
+        'true' if os.getenv('VERCEL') else 'false'
+    ).lower() in ('1', 'true', 'yes', 'on')
     SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax')
     CLOUDINARY_URL = os.getenv('CLOUDINARY_URL', '')
     _CLOUDINARY_FROM_URL = _parse_cloudinary_url(CLOUDINARY_URL)
@@ -50,6 +53,8 @@ class Config:
     MYSQL_PASSWORD = os.getenv('DB_PASSWORD', '')
     MYSQL_DB = os.getenv('DB_NAME', 'campus_events')
     MYSQL_SSL_CA = _resolve_path(os.getenv('DB_CA'))
+    MYSQL_SSL_VERIFY_CERT = os.getenv('DB_SSL_VERIFY_CERT', 'true' if MYSQL_SSL_CA else 'false').lower() in ('1', 'true', 'yes', 'on')
+    MYSQL_SSL_VERIFY_IDENTITY = os.getenv('DB_SSL_VERIFY_IDENTITY', 'false').lower() in ('1', 'true', 'yes', 'on')
 
 DB_CONFIG = {
     'host': Config.MYSQL_HOST,
@@ -58,4 +63,6 @@ DB_CONFIG = {
     'password': Config.MYSQL_PASSWORD,
     'database': Config.MYSQL_DB,
     'ssl_ca': Config.MYSQL_SSL_CA,
+    'ssl_verify_cert': Config.MYSQL_SSL_VERIFY_CERT,
+    'ssl_verify_identity': Config.MYSQL_SSL_VERIFY_IDENTITY,
 }

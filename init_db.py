@@ -17,6 +17,8 @@ def init_database():
         }
         if DB_CONFIG.get('ssl_ca'):
             conn_kwargs['ssl_ca'] = DB_CONFIG['ssl_ca']
+            conn_kwargs['ssl_verify_cert'] = DB_CONFIG.get('ssl_verify_cert', True)
+            conn_kwargs['ssl_verify_identity'] = DB_CONFIG.get('ssl_verify_identity', False)
 
         # Connect directly to the target database; managed hosts usually
         # do not grant CREATE DATABASE privileges to application users.
